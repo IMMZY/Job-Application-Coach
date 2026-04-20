@@ -1,0 +1,82 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.DEFAULT_AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Package Lambda
+        run: |
+          pip install -r requirements.txt -t package --quiet
+          cp *.py package/
+          cd package && zip -r ../infra/lambda.zip . -q
+          cd .. && rm -rf package
+          echo "Lambda ZIP size: $(du -sh infra/lambda.zip | cut -f1)"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Next.js static export
+        run: npm run build
+        env:
+          NEXT_STATIC_EXPORT: "true"
+          NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}
+          NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        working-directory: infra
+        run: terraform init
+
+      - name: Select or create dev workspace
+        working-directory: infra
+        run: terraform workspace select dev || terraform workspace new dev
+
+      - name: Terraform Plan
+        working-directory: infra
+        run: terraform plan -var="clerk_jwks_url=${{ secrets.CLERK_JWKS_URL }}"
+
+      - name: Terraform Apply
+        working-directory: infra
+        run: terraform apply -auto-approve -var="clerk_jwks_url=${{ secrets.CLERK_JWKS_URL }}"
+
+      - name: Upload frontend to S3
+        run: |
+          BUCKET=$(cd infra && terraform output -raw frontend_bucket)
+          aws s3 sync out/ s3://$BUCKET --delete --quiet
+
+      - name: Invalidate CloudFront cache
+        run: |
+          DIST_ID=$(cd infra && terraform output -raw cloudfront_domain | xargs -I{} aws cloudfront list-distributions --query "DistributionList.Items[?DomainName=='{}'].Id" --output text)
+          if [ -n "$DIST_ID" ]; then
+            aws cloudfront create-invalidation --distribution-id $DIST_ID --paths "/*"
+          fi

@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+boto3
+openai
+python-multipart
+fastapi-clerk-auth
+mangum
+pydantic[email]
+python-dotenv
